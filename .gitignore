@@ -1,0 +1,12 @@
+# Ignore everything
+*
+
+# Keep specific files
+!.gitignore
+!md_pipeline.py
+!lammpsreader.py
+
+
+# Keep tests
+!Tools
+!Tools/*.py
