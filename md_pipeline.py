@@ -10608,6 +10608,20 @@ class Analysis(Topology):
             args_per_vec = list(both_closest_neibs)
 
             seg_ids.append (np.array(args_per_vec))
+        
+        # enfornce uniqness/ Temporary fix. Should be checked later
+        
+        seg_ids_copy = []
+        seen = set()
+        
+        for sg in seg_ids:
+            key = tuple(sorted(sg))
+            if key not in seen:
+                seen.add(key)
+                seg_ids_copy.append(sg)
+
+        seg_ids = seg_ids_copy
+
         try:
             seg_ids = np.array(seg_ids)
         except:
