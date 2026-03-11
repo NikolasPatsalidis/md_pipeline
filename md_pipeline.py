@@ -10066,8 +10066,9 @@ class Analysis(Topology):
         available_methods = ['com','min']
         if method not in available_methods:
             raise ValueError('Uknown method {:s} --> choose from {:}'.format(method,available_methods))
-        ty_trick = self.at_types[self.mol_names == mol][0]
-        topol_vector = ' '.join([ty_trick,ty_trick])
+        
+        topol_vector = mol
+
         ids1,ids2 = self.find_vector_ids(topol_vector)  # segment endpoints for this molecule type
 
         segmental_ids = self.find_segmental_ids(ids1, ids2)  # map segments back to chain topology
