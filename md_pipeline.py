@@ -591,6 +591,15 @@ class supraClass():
 
         return kinetics
 
+    def conductivity(self, trajf, arg1, arg2):
+        self.read_timeframes(trajf)
+        data = self.mdobj.calc_conductivity_autocorrlation_t(arg1, arg2) # mdobj is an analysis class 
+        self.dealloc_timeframes()
+    	
+	data_post_process = data
+
+	return data_post_process
+
     def cluster_dynamics(self, trajf, mol, rcut, method='min'):
         """Compute cluster-size time evolution and isolated/clustered kinetics.
         Parameters
@@ -10016,6 +10025,21 @@ class Analysis(Topology):
         dists_t =  {t:np.sum(v*v,axis=1)**0.5 for t,v in vect.items()}
         return dists_t,filt_t
 
+    def calc_conductivity_autocorrelatio_t(self, arg1, arg2):
+    	# 1a) Take arg1 and arg2 
+	# 1b) Make necessary preparation 
+	# 1c)make args e.g. args = (arg1, arg2, something else with arg1 and arg2) or (arg1, arg2, data = dict() )
+	# 2) Name the core fucntion that you will use
+	data_to_fill = dict()
+	args = (arg1, arg2, data_to_fill)
+	func = 'green_kubo_conductivity'
+        nframes = self.loop_trajectory(func, args)
+	# after the call of self.loop_trajectory data_to_fill will contain necessary info for each frame
+
+	# if you need to post-process data_to_fill
+	# e.g. data_to_fill['nframes'] = nframes
+	return data_to_fill
+
     def list_molecule_ids(self,mol):
         """Group atom indices by molecule for a given species.
 
@@ -12974,6 +12998,18 @@ class coreFunctions():
     """
     def __init__():
         pass
+    @staticmethod
+    def green_kubo_conductivity(self, arg1, arg2, data_to_fill):
+            
+	    frame = self.current_frame
+
+	    coords = self.get_coords(frame)  # array (natoms,3)
+	    partial_charge = self.atom_charge # array(natoms,)
+	    # v = coords[id1] - coords[id2] example of vector calculation per frame
+	    key = self.get_key(key) # time 
+	    #data_to_fill[key] = v 
+	    data_to_fill[key] = # do something with coords and partials_charges
+	    return
 
     @staticmethod
     def stress_per_atom_t(self,filters,atomstress,filt_per_t):
