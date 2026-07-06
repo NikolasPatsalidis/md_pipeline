@@ -592,20 +592,59 @@ class supraClass():
         return kinetics
 
     def conductivity(self, trajf, ions_topol_vec, direction=[1,1,1],
-                      filters=dict(), dynOptions=dict()):
-        """ Compute segmental mean-squared displacement (MSD).
+                      filters=dict(), multy_origin=True, every=1,
+                      both_times=True, both_pairs=True):
+        """Compute ionic conductivity via self and distinct MSD terms.
+
+        Calculates charge-weighted self-diffusion and cross-correlation
+        (distinct) terms for ionic conductivity. Center-of-mass trajectories
+        are multiplied by ion charges before computing MSD.
+
         Parameters
         ----------
-        trajf : str or list, trajectory file(s)
-        ions_topol_vec : int, index of segment vector
-        direction : array-like, projection direction (e.g., [1,1,1])
-        filters : dict, optional trajectory filters
-        dynOptions : dict, MSD computation options
+        trajf : str or list
+            Trajectory file path(s) to analyze.
+        ions_topol_vec : list of str
+            List of ion identifiers (molecule names or segment types)
+            to include in the conductivity calculation.
+        direction : array-like, optional
+            Projection direction for anisotropic conductivity, e.g.,
+            [1,0,0] for x-direction only. Default [1,1,1] uses all directions.
+        filters : dict, optional
+            Trajectory filters to apply, e.g., {'region': region_filter}.
+            Each filter produces a separate distinct-term calculation.
+        multy_origin : bool, optional
+            If True (default), use multiple time origins for averaging.
+        every : int, optional
+            Stride between successive time origins. Default 1.
+        both_times : bool, optional
+            If True (default), require filter True at both t0 and tau.
+        both_pairs : bool, optional
+            If True (default), require filter True for both particles i and j
+            in cross-correlation terms.
+
         Returns
         -------
-        dyn : dict, MSD results
+        diffusion_self : dict
+            Self-diffusion MSD results keyed by ion type, e.g.,
+            {'Na': {'time': ..., 'MSD': ...}}.
+        diffusion_distinct : dict
+            Distinct (cross) MSD results keyed by ion pairs, e.g.,
+            {'Na--Cl': {'time': ..., 'cross_msd': ...}}.
         """
+        # handle options
         direction = self.check_direction(direction)
+        
+        dynOptions = {'multy_origin':multy_origin, 
+                        'every':every, 
+                        'both_times':both_times,
+                        'both_pairs':both_pairs
+                     }
+        if both_times:
+            dynOptions_self = {'filt_option':'strict'}
+        else:
+            dynOptions_self = {'filt_option':'simple'}
+
 
         # Load trajectory frames
         self.read_timeframes(trajf)
@@ -629,24 +668,44 @@ class supraClass():
             ions_info[f'ft_{ion}'] = ft
 
             # Compute MSD from projected coordinates
-            diffusion_self[f'{ion}'] = self.computeDynamics('MSD', 
-                                            ions_info[f'zcmt_{ion}'], ft, dynOptions)
+            temp_dict = self.computeDynamics('MSD', ions_info[f'zcmt_{ion}'], ft, dynOptions_self)
+            if ft is None or len(ft)==0:
+                diffusion_self[f'{ion}'] = temp_dict
+            else:
+                for key in temp_dict.keys():
+                    diffusion_self[f'{ion}__{key}'] = temp_dict[key]
+
             print(f'Self diffusion {ion}: {perf_counter() - t_ion:.3f} sec', flush=True)
 
         # distinct terms
-        diffusion_dinstict = dict()
+        diffusion_distinct = dict()
         for idx1, ion1 in enumerate(ions_topol_vec):
             zcm1 = ions_info[f'zcmt_{ion1}']
+            ft1 = ions_info[f'ft_{ion1}']
             for idx2, ion2 in enumerate(ions_topol_vec):
                 if idx2 < idx1: 
                     continue # avoid recalculating twice the cross-dinstict terms 
                 t_cross = perf_counter()
                 zcm2 = ions_info[f'zcmt_{ion2}']
-                diffusion_dinstict[f'{ion1}--{ion2}'] = self.mdobj.crossDynamics(zcm1, zcm2)
+                ft2 = ions_info[f'ft_{ion2}']
+                diffusion_distinct[f'{ion1}--{ion2}'] = self.mdobj.crossDynamics(
+                    zcm1, zcm2, None, None, **dynOptions)
+                for key in ft1.keys():
+                    f1 = ft1[key]
+                    f2 = ft2[key]
+                    diffusion_distinct[f'{ion1}--{ion2}__{key}'] = self.mdobj.crossDynamics(
+                    zcm1, zcm2, f1, f2, **dynOptions)
                 print(f'Distinct {ion1}--{ion2}: {perf_counter() - t_cross:.3f} sec', flush=True)
 
         self.dealloc_timeframes()
-        return diffusion_self, diffusion_dinstict
+        
+        diffusion = dict()
+        for key in diffusion_self.keys():
+            diffusion[f'self_{key}'] = diffusion_self[key]
+        for key in diffusion_distinct.keys():
+            diffusion[f'distinct_{key}'] = diffusion_distinct[key]
+        
+        return diffusion
     	
 
 
@@ -11200,7 +11259,9 @@ class Analysis(Topology):
             return vec_t, filt_per_t, segmental_ids
         
     
-    def crossDynamics(self, xt1, xt2, avoid_self=True, multy_origin=True, every=1):
+    def crossDynamics(self, xt1, xt2, ft1=None, ft2=None, avoid_self=True,
+                       both_times=True, both_pairs=True,
+                       multy_origin=True, every=1):
         """Compute cross-correlation MSD between two trajectory sets.
 
         Calculates the distinct diffusion term: sum over i,j of
@@ -11210,8 +11271,15 @@ class Analysis(Topology):
         ----------
         xt1, xt2 : dict
             Time-indexed trajectories {t: array(n_particles, D)}.
+        ft1, ft2 : dict or None, optional
+            Time-indexed filter masks {t: array(n_particles,)} for each set.
+            If None, all particles are included.
         avoid_self : bool, optional
             If True (default), skip i=j pairs (for same-type distinct terms).
+        both_times : bool, optional
+            If True (default), require filter True at both t0 and tau.
+        both_pairs : bool, optional
+            If True (default), require filter True for both particles i and j.
         multy_origin : bool, optional
             If True, use multiple time origins for averaging.
         every : int, optional
@@ -11230,9 +11298,25 @@ class Analysis(Topology):
         x_nump1 = self.init_xt(xt1)
         x_nump2 = self.init_xt(xt2)
 
-        CrossDynamicProperty_kernel(Prop_nump, nv, x_nump1, x_nump2,
+        # If no filters provided, create all-True masks
+        provided_ft1 = ft1 is not None and len(ft1) == len(xt1) and ft1[0].shape[0] == xt1[0].shape[0]
+        provided_ft2 = ft2 is not None and len(ft2) == len(xt2) and ft2[0].shape[0] == xt2[0].shape[0]
+        
+        if not provided_ft1 and provided_ft2:
+            ft1 = {t: np.ones(x.shape[0], dtype=bool) for t, x in xt1.items()}
+        if not provided_ft2 and provided_ft1:
+            ft2 = {t: np.ones(x.shape[0], dtype=bool) for t, x in xt2.items()}
+        
+        if provided_ft1 or provided_ft2:
+            f_nump1 = self.init_xt(ft1, dtype=bool)
+            f_nump2 = self.init_xt(ft2, dtype=bool)
+        
+            CrossDynamicProperty_filterkernel(Prop_nump, nv, x_nump1, x_nump2, f_nump1, f_nump2,
+                                    multy_origin, every, avoid_self,
+                                    both_times, both_pairs)
+        else:
+            CrossDynamicProperty_kernel(Prop_nump, nv, x_nump1, x_nump2, 
                                     multy_origin, every, avoid_self)
-
         t = ass.numpy_keys(xt1)
         result = {'time': t - t.min(), 'cross_msd': Prop_nump}
 
@@ -14834,8 +14918,38 @@ def DynamicProperty_kernel(func,func_args,inner_func,
         Prop[i] /= nv[i]
     return
 
+@jit(nopython=True, fastmath=True)
+def cross_in_population(fit0, fitau, fjt0, fjtau, both_times, both_pairs):
+    """Check if particle pair passes filter criteria for cross-correlation.
+    
+    Parameters
+    ----------
+    fit0, fitau : bool
+        Filter values for particle i at t0 and tau.
+    fjt0, fjtau : bool
+        Filter values for particle j at t0 and tau.
+    both_times : bool
+        If True, require filter True at both t0 and tau.
+    both_pairs : bool
+        If True, require filter True for both particles i and j.
+    
+    Returns
+    -------
+    bool
+        True if pair passes filter criteria.
+    """
+    if both_times and both_pairs:
+        return fit0 and fitau and fjt0 and fjtau
+    elif both_times and not both_pairs:
+        return fit0 and fitau
+    elif not both_times and both_pairs:
+        return fitau and fjtau
+    else:
+        return fitau
+
 @jit(nopython=True,fastmath=True,parallel=True)
-def CrossDynamicProperty_kernel(Prop, nv, xt1, xt2, multy_origin, every, avoid_self):
+def CrossDynamicProperty_kernel(Prop, nv, xt1, xt2,
+                                 multy_origin, every, avoid_self):
     """Numba kernel for cross-correlation MSD between two trajectory sets.
 
     Computes the distinct diffusion term: sum over i,j of (Δr1_i · Δr2_j).
@@ -14867,16 +14981,82 @@ def CrossDynamicProperty_kernel(Prop, nv, xt1, xt2, multy_origin, every, avoid_s
     else:
         mo = 1
 
-    for t in range(0, mo, every):
-        for tau in prange(t, nframes):
+    for t0 in range(0, mo, every):
+        for tau in prange(t0, nframes):
             val = 0.0
             for i in range(n1):
                 for j in range(n2):
                     if avoid_self and i == j:
                         continue
-                    val += cross_msd_kernel(xt1[t, i], xt1[tau, i],
-                                            xt2[t, j], xt2[tau, j])
-            idx = tau - t
+                    val += cross_msd_kernel(xt1[t0, i], xt1[tau, i],
+                                            xt2[t0, j], xt2[tau, j])
+            idx = tau - t0
+            Prop[idx] += val
+            nv[idx] += 1.0
+
+    for i in prange(nframes):
+        if nv[i] > 0:
+            Prop[i] /= nv[i]
+    return
+
+
+@jit(nopython=True,fastmath=True,parallel=True)
+def CrossDynamicProperty_filterkernel(Prop, nv, xt1, xt2, ft1, ft2,
+                                 multy_origin, every, avoid_self,
+                                 both_times, both_pairs):
+    """Numba kernel for cross-correlation MSD between two trajectory sets.
+
+    Computes the distinct diffusion term: sum over i,j of (Δr1_i · Δr2_j).
+    When avoid_self=True, skips i=j pairs (for same-type distinct terms).
+
+    Parameters
+    ----------
+    Prop : ndarray, shape (nframes,)
+        Output array for accumulated cross-MSD values per lag time.
+    nv : ndarray, shape (nframes,)
+        Normalisation counts per lag, updated in place.
+    xt1 : ndarray, shape (nframes, n1, D)
+        Trajectory of particle set 1.
+    xt2 : ndarray, shape (nframes, n2, D)
+        Trajectory of particle set 2.
+    ft1 : ndarray, shape (nframes, n1)
+        Filter mask for particle set 1.
+    ft2 : ndarray, shape (nframes, n2)
+        Filter mask for particle set 2.
+    multy_origin : bool
+        If True, use multiple time origins; otherwise single origin.
+    every : int
+        Stride between successive time origins.
+    avoid_self : bool
+        If True, skip i=j pairs in the double sum.
+    both_times : bool
+        If True, require filter True at both t0 and tau.
+    both_pairs : bool
+        If True, require filter True for both particles i and j.
+    """
+    nframes = xt1.shape[0]
+    n1 = xt1.shape[1]
+    n2 = xt2.shape[1]
+
+    if multy_origin:
+        mo = nframes
+    else:
+        mo = 1
+
+    for t0 in range(0, mo, every):
+        for tau in prange(t0, nframes):
+            val = 0.0
+            for i in range(n1):
+                for j in range(n2):
+                    if avoid_self and i == j:
+                        continue
+                    if not cross_in_population(ft1[t0, i], ft1[tau, i],
+                                               ft2[t0, j], ft2[tau, j],
+                                               both_times, both_pairs):
+                        continue
+                    val += cross_msd_kernel(xt1[t0, i], xt1[tau, i],
+                                            xt2[t0, j], xt2[tau, j])
+            idx = tau - t0
             Prop[idx] += val
             nv[idx] += 1.0
 
