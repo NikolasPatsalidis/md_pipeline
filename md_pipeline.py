@@ -591,14 +591,64 @@ class supraClass():
 
         return kinetics
 
-    def conductivity(self, trajf, arg1, arg2):
-        self.read_timeframes(trajf)
-        data = self.mdobj.calc_conductivity_autocorrlation_t(arg1, arg2) # mdobj is an analysis class 
-        self.dealloc_timeframes()
-    	
-	data_post_process = data
+    def conductivity(self, trajf, ions_topol_vec, direction=[1,1,1],
+                      filters=dict(), dynOptions=dict()):
+        """ Compute segmental mean-squared displacement (MSD).
+        Parameters
+        ----------
+        trajf : str or list, trajectory file(s)
+        ions_topol_vec : int, index of segment vector
+        direction : array-like, projection direction (e.g., [1,1,1])
+        filters : dict, optional trajectory filters
+        dynOptions : dict, MSD computation options
+        Returns
+        -------
+        dyn : dict, MSD results
+        """
+        direction = self.check_direction(direction)
 
-	return data_post_process
+        # Load trajectory frames
+        self.read_timeframes(trajf)
+        ions_info = dict()
+        diffusion_self = dict()
+        # self terms and self diffusion
+        for ion in ions_topol_vec:
+            t_ion = perf_counter()
+            # Compute 0) segment center-of-mass trajectory 1) filter(s) trajectory
+            cmt, ft, seg_ids = self.mdobj.calc_segCM_t(ion, filters=filters, return_seg_ids = True)
+            # Apply directional projection if required
+            if not (direction == np.ones(3)).all():
+                cmt = {t: c * direction for t, c in cmt.items()}
+            
+            # shape (nions, 1)
+            ion_charge = self.mdobj.atom_charge[seg_ids].sum(axis=1, keepdims=True)
+            
+            ions_info[f'cmt_{ion}'] = cmt
+            ions_info[f'z_{ion}'] = ion_charge
+            ions_info[f'zcmt_{ion}'] = { t : c*ion_charge for t, c in cmt.items() }
+            ions_info[f'ft_{ion}'] = ft
+
+            # Compute MSD from projected coordinates
+            diffusion_self[f'{ion}'] = self.computeDynamics('MSD', 
+                                            ions_info[f'zcmt_{ion}'], ft, dynOptions)
+            print(f'Self diffusion {ion}: {perf_counter() - t_ion:.3f} sec', flush=True)
+
+        # distinct terms
+        diffusion_dinstict = dict()
+        for idx1, ion1 in enumerate(ions_topol_vec):
+            zcm1 = ions_info[f'zcmt_{ion1}']
+            for idx2, ion2 in enumerate(ions_topol_vec):
+                if idx2 < idx1: 
+                    continue # avoid recalculating twice the cross-dinstict terms 
+                t_cross = perf_counter()
+                zcm2 = ions_info[f'zcmt_{ion2}']
+                diffusion_dinstict[f'{ion1}--{ion2}'] = self.mdobj.crossDynamics(zcm1, zcm2)
+                print(f'Distinct {ion1}--{ion2}: {perf_counter() - t_cross:.3f} sec', flush=True)
+
+        self.dealloc_timeframes()
+        return diffusion_self, diffusion_dinstict
+    	
+
 
     def cluster_dynamics(self, trajf, mol, rcut, method='min'):
         """Compute cluster-size time evolution and isolated/clustered kinetics.
@@ -10025,20 +10075,6 @@ class Analysis(Topology):
         dists_t =  {t:np.sum(v*v,axis=1)**0.5 for t,v in vect.items()}
         return dists_t,filt_t
 
-    def calc_conductivity_autocorrelatio_t(self, arg1, arg2):
-    	# 1a) Take arg1 and arg2 
-	# 1b) Make necessary preparation 
-	# 1c)make args e.g. args = (arg1, arg2, something else with arg1 and arg2) or (arg1, arg2, data = dict() )
-	# 2) Name the core fucntion that you will use
-	data_to_fill = dict()
-	args = (arg1, arg2, data_to_fill)
-	func = 'green_kubo_conductivity'
-        nframes = self.loop_trajectory(func, args)
-	# after the call of self.loop_trajectory data_to_fill will contain necessary info for each frame
-
-	# if you need to post-process data_to_fill
-	# e.g. data_to_fill['nframes'] = nframes
-	return data_to_fill
 
     def list_molecule_ids(self,mol):
         """Group atom indices by molecule for a given species.
@@ -10512,6 +10548,7 @@ class Analysis(Topology):
         mapper = {'p1':'costh_kernel',
                   'p2':'cos2th_kernel',
                   'msd':'norm_square_kernel',
+                   #'msd_cross':'cross_msd',
                   'scalar':'mult_kernel',
                   'fs':'Fs_kernel',
                   }  # map high-level prop names to inner kernels
@@ -11122,7 +11159,9 @@ class Analysis(Topology):
         ass.print_time(tf,inspect.currentframe().f_code.co_name,nframes)
         return c_t,filt_t
 
-    def calc_segCM_t(self,topol_vector, filters=dict()):
+
+
+    def calc_segCM_t(self,topol_vector, filters=dict(), return_seg_ids=False):
         """Centres of mass of polymer segments versus time.
 
         Parameters
@@ -11155,8 +11194,51 @@ class Analysis(Topology):
 
         tf = perf_counter() - t0
         ass.print_time(tf,inspect.currentframe().f_code.co_name,nframes)
+        if not return_seg_ids:
+            return vec_t,filt_per_t
+        else:
+            return vec_t, filt_per_t, segmental_ids
+        
+    
+    def crossDynamics(self, xt1, xt2, avoid_self=True, multy_origin=True, every=1):
+        """Compute cross-correlation MSD between two trajectory sets.
 
-        return vec_t,filt_per_t
+        Calculates the distinct diffusion term: sum over i,j of
+        ⟨(r1_i(t) - r1_i(0)) · (r2_j(t) - r2_j(0))⟩.
+
+        Parameters
+        ----------
+        xt1, xt2 : dict
+            Time-indexed trajectories {t: array(n_particles, D)}.
+        avoid_self : bool, optional
+            If True (default), skip i=j pairs (for same-type distinct terms).
+        multy_origin : bool, optional
+            If True, use multiple time origins for averaging.
+        every : int, optional
+            Stride between successive time origins.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys 'time' and 'cross_msd'.
+        """
+        tinit = perf_counter()
+
+        assert len(xt1) == len(xt2), "not equal frames for arrays to cross correlate"
+
+        Prop_nump, nv = self.init_prop(xt1)
+        x_nump1 = self.init_xt(xt1)
+        x_nump2 = self.init_xt(xt2)
+
+        CrossDynamicProperty_kernel(Prop_nump, nv, x_nump1, x_nump2,
+                                    multy_origin, every, avoid_self)
+
+        t = ass.numpy_keys(xt1)
+        result = {'time': t - t.min(), 'cross_msd': Prop_nump}
+
+        tf = perf_counter() - tinit
+        ass.print_time(tf, inspect.currentframe().f_code.co_name)
+        return result
 
     def Dynamics(self,prop,xt,filt_t=None,weights_t=None,
                  filt_option='simple', block_average=False,
@@ -12998,18 +13080,6 @@ class coreFunctions():
     """
     def __init__():
         pass
-    @staticmethod
-    def green_kubo_conductivity(self, arg1, arg2, data_to_fill):
-            
-	    frame = self.current_frame
-
-	    coords = self.get_coords(frame)  # array (natoms,3)
-	    partial_charge = self.atom_charge # array(natoms,)
-	    # v = coords[id1] - coords[id2] example of vector calculation per frame
-	    key = self.get_key(key) # time 
-	    #data_to_fill[key] = v 
-	    data_to_fill[key] = # do something with coords and partials_charges
-	    return
 
     @staticmethod
     def stress_per_atom_t(self,filters,atomstress,filt_per_t):
@@ -14764,6 +14834,57 @@ def DynamicProperty_kernel(func,func_args,inner_func,
         Prop[i] /= nv[i]
     return
 
+@jit(nopython=True,fastmath=True,parallel=True)
+def CrossDynamicProperty_kernel(Prop, nv, xt1, xt2, multy_origin, every, avoid_self):
+    """Numba kernel for cross-correlation MSD between two trajectory sets.
+
+    Computes the distinct diffusion term: sum over i,j of (Δr1_i · Δr2_j).
+    When avoid_self=True, skips i=j pairs (for same-type distinct terms).
+
+    Parameters
+    ----------
+    Prop : ndarray, shape (nframes,)
+        Output array for accumulated cross-MSD values per lag time.
+    nv : ndarray, shape (nframes,)
+        Normalisation counts per lag, updated in place.
+    xt1 : ndarray, shape (nframes, n1, D)
+        Trajectory of particle set 1.
+    xt2 : ndarray, shape (nframes, n2, D)
+        Trajectory of particle set 2.
+    multy_origin : bool
+        If True, use multiple time origins; otherwise single origin.
+    every : int
+        Stride between successive time origins.
+    avoid_self : bool
+        If True, skip i=j pairs in the double sum.
+    """
+    nframes = xt1.shape[0]
+    n1 = xt1.shape[1]
+    n2 = xt2.shape[1]
+
+    if multy_origin:
+        mo = nframes
+    else:
+        mo = 1
+
+    for t in range(0, mo, every):
+        for tau in prange(t, nframes):
+            val = 0.0
+            for i in range(n1):
+                for j in range(n2):
+                    if avoid_self and i == j:
+                        continue
+                    val += cross_msd_kernel(xt1[t, i], xt1[tau, i],
+                                            xt2[t, j], xt2[tau, j])
+            idx = tau - t
+            Prop[idx] += val
+            nv[idx] += 1.0
+
+    for i in prange(nframes):
+        if nv[i] > 0:
+            Prop[i] /= nv[i]
+    return
+
 @jit(nopython=True,fastmath=True)
 def get__args(i,j,xt,ft,wt):
     """Build basic (unfiltered, unweighted) argument tuple for kernels.
@@ -15317,6 +15438,29 @@ def norm_square_kernel(r1,r2,*args):
         ri = r2[i] - r1[i]
         nm+= ri*ri
     return nm
+
+@jit(nopython=True,fastmath=True)
+def cross_msd_kernel(r1_0, r1_t, r2_0, r2_t):
+    """Dot product of displacements for cross-correlation MSD.
+
+    Computes (r1_t - r1_0) · (r2_t - r2_0) for distinct diffusion terms.
+
+    Parameters
+    ----------
+    r1_0, r1_t : ndarray, shape (D,)
+        Position of particle 1 at origin and lag time.
+    r2_0, r2_t : ndarray, shape (D,)
+        Position of particle 2 at origin and lag time.
+
+    Returns
+    -------
+    float
+        Dot product of the two displacement vectors.
+    """
+    dot = 0.0
+    for d in range(r1_0.shape[0]): # typically, over the 3 dimensions
+        dot += (r1_t[d] - r1_0[d]) * (r2_t[d] - r2_0[d])
+    return dot
 
 @jit(nopython=True,fastmath=True,parallel=True)
 def costh__parallelkernel(r1,r2,*args):
