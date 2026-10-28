@@ -20,6 +20,7 @@ def main():
     help_conftype = "Type of confinment. Providing this the algorithm assumes we have a confined system"
     help_polymer = "Polymer name or molecule ids or atom type or atom ids"
     help_particle = "Particle name or molecule ids or atom type or atom ids"
+    help_reference_point_method = "Reference point for distances: 'origin', 'center' (box center), molecule name or molecule id (center of mass), atom id or [x,y,z]"
     help_adsorption_interval = "tuple or list of tuples. Denotes the distance intervale between particle and polymer in which the polymer is considered adsorbed"
     help_property_args = "tuple: arguments for the 'property' to be computed"
     help_property_kwargs = "dictionary: keyword arguments for the property to be computed"
@@ -48,6 +49,8 @@ def main():
             type=str, required=False, help=help_particle)
     argparser.add_argument('-polymer',"--polymer",metavar=None,
             type=str, required=False, help=help_polymer)
+    argparser.add_argument('-rp',"--reference_point_method",metavar=None,
+            type=str, required=False, help=help_reference_point_method)
     argparser.add_argument('-pargs',"--property_args",metavar=None,
             type=str, required=False,default='tuple()', help=help_property_args)
     argparser.add_argument('-pkwargs',"--property_kwargs",metavar=None,
@@ -60,9 +63,11 @@ def main():
 
     known_init_kwargs = ['memory_demanding','keep_frames','conftype',
                          'adsorption_interval','particle_method','polymer_method',
-                        'train_custom_method','polymer','particle']
+                        'train_custom_method','polymer','particle',
+                        'reference_point_method']
 
     evaluated_strings = ['trajf','connectivity','polymer','particle',
+                         'reference_point_method',
                          'train_costum_method','adsorption_interval',
                          'property_args','property_kwargs']
     margs = dict()
