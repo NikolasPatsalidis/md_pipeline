@@ -1,5 +1,11 @@
 """
 credits Nikolaos Patsalidis
+
+Comments for the current file:
+Attention !!! The md_pipeline code has been modified to overcome the OOM errors in the Sq analysis!!!
+Attention !!! The functions: find_gr_pairs and gofr_pairs have changed !!!
+Attention !!! The function normalize_gofr is described with far_rho while the calc_Sq_byInverseGr is described by a rho so the latter changed to far_rho!!!
+Attention !!! this md_pipeline has been modified based on the ionic conductivity version to include the new needed functions !!!
 """
 
 import numpy as np
@@ -22,10 +28,11 @@ import pandas as pd
 
 import matplotlib
 
-import lammpsreader
+#import lammpsreader
 
 import pickle
-
+import psutil
+import os
 
 @jit(nopython=True, fastmath=True)
 def compute_residual(pars, A, y):
@@ -630,7 +637,7 @@ class supraClass():
             {'Na': {'time': ..., 'MSD': ...}}.
         diffusion_distinct : dict
             Distinct (cross) MSD results keyed by ion pairs, e.g.,
-            {'Na--Cl': {'time': ..., 'cross_msd': ...}}.
+            {'Na--Cl': {'time': ..., 'cross_TSD': ...}}.
         """
         # handle options
         direction = self.check_direction(direction)
@@ -666,14 +673,18 @@ class supraClass():
             ions_info[f'z_{ion}'] = ion_charge
             ions_info[f'zcmt_{ion}'] = { t : c*ion_charge for t, c in cmt.items() }
             ions_info[f'ft_{ion}'] = ft
+            nions = len(cmt[list(cmt.keys())[0]])
+            ions_info[f'nions_{ion}'] = nions
 
             # Compute MSD from projected coordinates
             temp_dict = self.computeDynamics('MSD', ions_info[f'zcmt_{ion}'], ft, dynOptions_self)
             if ft is None or len(ft)==0:
-                diffusion_self[f'{ion}'] = temp_dict
+                diffusion_self[f'{ion}'] = {k.replace('MSD','TSD'): v*nions if k != 'time' else v
+                                            for k, v in temp_dict.items()}
             else:
                 for key in temp_dict.keys():
-                    diffusion_self[f'{ion}__{key}'] = temp_dict[key]
+                    diffusion_self[f'{ion}__{key}'] = {k.replace('MSD','TSD'): v*nions if k != 'time' else v
+                                                       for k, v in temp_dict[key].items()}
 
             print(f'Self diffusion {ion}: {perf_counter() - t_ion:.3f} sec', flush=True)
 
@@ -688,13 +699,16 @@ class supraClass():
                 t_cross = perf_counter()
                 zcm2 = ions_info[f'zcmt_{ion2}']
                 ft2 = ions_info[f'ft_{ion2}']
+                
+                avoid_self = ion1 == ion2 
                 diffusion_distinct[f'{ion1}--{ion2}'] = self.mdobj.crossDynamics(
-                    zcm1, zcm2, None, None, **dynOptions)
+                    zcm1, zcm2, None, None, **dynOptions, avoid_self = avoid_self)
                 for key in ft1.keys():
                     f1 = ft1[key]
                     f2 = ft2[key]
+                    avoid_self = ion1 == ion2
                     diffusion_distinct[f'{ion1}--{ion2}__{key}'] = self.mdobj.crossDynamics(
-                    zcm1, zcm2, f1, f2, **dynOptions)
+                    zcm1, zcm2, f1, f2, avoid_self = avoid_self, **dynOptions)
                 print(f'Distinct {ion1}--{ion2}: {perf_counter() - t_cross:.3f} sec', flush=True)
 
         self.dealloc_timeframes()
@@ -707,7 +721,6 @@ class supraClass():
         
         return diffusion
     	
-
 
     def cluster_dynamics(self, trajf, mol, rcut, method='min'):
         """Compute cluster-size time evolution and isolated/clustered kinetics.
@@ -4997,8 +5010,8 @@ class Distance_Functions():
         return d1
 
     @staticmethod
-    def zcylindrical(self,coords,cref):
-         r = coords[:,0:2]-c[0:2]
+    def zcylindrical(coords,cref): #NF removed (self,)#
+         r = coords[:,0:2]-cref[0:2] #NF changed c -> cref#
          d = np.sqrt(np.sum(r*r,axis=1))
          return d
 
@@ -8491,7 +8504,12 @@ class Topology:
         self.exclusions = {(mapids[c[0]],mapids[c[1]]): val for c,val in self.exclusions.items()}
         self.angles = {(mapids[c[0]],mapids[c[1]],mapids[c[2]]): val for c,val in self.angles.items()}
         self.dihedrals = {(mapids[c[0]],mapids[c[1]],mapids[c[2]],mapids[c[3]]): val for c,val in self.dihedrals.items()}
-        self.neibs = {mapids[j]:{mapids[neib] for neib in s } for j,s in self.neibs.items()}
+        #print(self.neibs)
+        #for j,s in self.neibs.items():
+         #   for neib in s:
+          #      print(j,neib)
+           #     print(mapids[j],mapids[neib])
+        #self.neibs = {mapids[j]:{mapids[neib] for neib in s } for j,s in self.neibs.items()}
 
         for frame in self.timeframes:
 
@@ -10095,7 +10113,7 @@ class Analysis(Topology):
         q =np.arange(qmin+dq,qmax+dq,dq)
         d = res['d']
         g = res['gr']
-        rho = res['rho']
+        rho = res['far_rho']
         box = self.box_mean()
         # Step 2: choose appropriate Fourier kernel based on requested projection
         if direction is None or direction =='':
@@ -10107,7 +10125,6 @@ class Analysis(Topology):
 
         res['Sq'] = Sq
         res['q'] = q
-
         return res
 
     def calc_internal_distance(self,n,filters=dict()):
@@ -10133,7 +10150,6 @@ class Analysis(Topology):
         # Convert per-frame bond vectors into Euclidean distances
         dists_t =  {t:np.sum(v*v,axis=1)**0.5 for t,v in vect.items()}
         return dists_t,filt_t
-
 
     def list_molecule_ids(self,mol):
         """Group atom indices by molecule for a given species.
@@ -10185,9 +10201,8 @@ class Analysis(Topology):
         available_methods = ['com','min']
         if method not in available_methods:
             raise ValueError('Uknown method {:s} --> choose from {:}'.format(method,available_methods))
-        
-        topol_vector = mol
-
+        ty_trick = self.at_types[self.mol_names == mol][0]
+        topol_vector = ' '.join([ty_trick,ty_trick])
         ids1,ids2 = self.find_vector_ids(topol_vector)  # segment endpoints for this molecule type
 
         segmental_ids = self.find_segmental_ids(ids1, ids2)  # map segments back to chain topology
@@ -10307,7 +10322,7 @@ class Analysis(Topology):
         else:
             raise ValueError('uknown way to find ids')
         return ids
-
+    
     def find_gr_pairs(self,ty1,ty2,intra=False,inter=False):
         """Select atom pairs to be used in :math:`g(r)` calculations.
 
@@ -10339,30 +10354,37 @@ class Analysis(Topology):
         ids1 = self.get_ids_based_on_atomtype(ty1)
         ids2 = self.get_ids_based_on_atomtype(ty2)
 
-        # Build all distinct (i,j) pairs for the requested atom sets
-        pairs = [[i,j] for i in ids1 for j in ids2 if i!=j ]
-        npairs = len(pairs)
-        pairs = np.array(pairs)
+        print(f"DEBUG: Vectorizing {len(ids1)} x {len(ids2)} pairs...", flush=True)
 
+        # 1. Build all distinct (i,j) pairs using Memory-Efficient NumPy
+        # np.repeat and np.tile avoid Python list overhead completely
+        i_idx = np.repeat(ids1, len(ids2))
+        j_idx = np.tile(ids2, len(ids1))
+
+        # 2. Filter out self-correlations (i != j)
+        mask = (i_idx != j_idx)
+        i_idx = i_idx[mask]
+        j_idx = j_idx[mask]
+
+        # 3. Vectorized Intra / Inter molecular filtering
         if intra:
-            filt = np.ones(npairs,dtype=bool)
-            for i,j in enumerate(pairs):
-
-                if self.mol_ids[j[0]] == self.mol_ids[j[1]]:
-                    filt[i] = False
-
-            pairs = pairs[filt]
+            print("DEBUG: Filtering for INTRA-molecular pairs...", flush=True)
+            # Keep pairs where molecule IDs are exactly the same
+            mol_mask = (self.mol_ids[i_idx] == self.mol_ids[j_idx])
+            i_idx = i_idx[mol_mask]
+            j_idx = j_idx[mol_mask]
 
         if inter:
-            filt = np.ones(npairs,dtype=bool)
-            for i,j in enumerate(pairs):
+            print("DEBUG: Filtering for INTER-molecular pairs...", flush=True)
+            # Keep pairs where molecule IDs are different
+            mol_mask = (self.mol_ids[i_idx] != self.mol_ids[j_idx])
+            i_idx = i_idx[mol_mask]
+            j_idx = j_idx[mol_mask]
 
-                if self.mol_ids[j[0]] != self.mol_ids[j[1]]:
-                    filt[i] = False
+        print(f"DEBUG: find_gr_pairs finished successfully. Total pairs: {len(i_idx)}", flush=True)
 
-            pairs = pairs[filt]
-
-        return pairs[:,0], pairs[:,1], len(ids1), pairs.shape[0]
+        return i_idx, j_idx, len(ids1), len(i_idx)
+        #The above function is corrected/edited !!!#
 
     def calc_pair_distribution(self,binl,dmax,type1=None,type2=None,intra=False,inter=False,
                                far_region=0.8):
@@ -10406,11 +10428,13 @@ class Analysis(Topology):
         :meth:`normalize_gofr` to post‑process the raw histogram.
         """
         t0 = perf_counter()
+        print("DEBUG: Starting find_gr_pairs...", flush=True)
 
         bins = np.arange(0,dmax+binl,binl)
         gofr = np.zeros(bins.shape[0]-1,dtype=float)
 
         ids1,ids2, n1 ,n = self.find_gr_pairs(type1,type2,intra,inter)
+        print(f"DEBUG: find_gr_pairs finished. Found {len(ids1)} pairs.", flush=True)
 
         args = (ids1,ids2,bins,gofr)
 
@@ -10607,7 +10631,7 @@ class Analysis(Topology):
         mapper = {'p1':'costh_kernel',
                   'p2':'cos2th_kernel',
                   'msd':'norm_square_kernel',
-                   #'msd_cross':'cross_msd',
+                   #'msd_cross':'cross_TSD',
                   'scalar':'mult_kernel',
                   'fs':'Fs_kernel',
                   }  # map high-level prop names to inner kernels
@@ -11218,8 +11242,6 @@ class Analysis(Topology):
         ass.print_time(tf,inspect.currentframe().f_code.co_name,nframes)
         return c_t,filt_t
 
-
-
     def calc_segCM_t(self,topol_vector, filters=dict(), return_seg_ids=False):
         """Centres of mass of polymer segments versus time.
 
@@ -11257,8 +11279,7 @@ class Analysis(Topology):
             return vec_t,filt_per_t
         else:
             return vec_t, filt_per_t, segmental_ids
-        
-    
+
     def crossDynamics(self, xt1, xt2, ft1=None, ft2=None, avoid_self=True,
                        both_times=True, both_pairs=True,
                        multy_origin=True, every=1):
@@ -11288,7 +11309,7 @@ class Analysis(Topology):
         Returns
         -------
         dict
-            Dictionary with keys 'time' and 'cross_msd'.
+            Dictionary with keys 'time' and 'cross_TSD'.
         """
         tinit = perf_counter()
 
@@ -11318,11 +11339,12 @@ class Analysis(Topology):
             CrossDynamicProperty_kernel(Prop_nump, nv, x_nump1, x_nump2, 
                                     multy_origin, every, avoid_self)
         t = ass.numpy_keys(xt1)
-        result = {'time': t - t.min(), 'cross_msd': Prop_nump}
+        result = {'time': t - t.min(), 'cross_TSD': Prop_nump}
 
         tf = perf_counter() - tinit
         ass.print_time(tf, inspect.currentframe().f_code.co_name)
         return result
+
 
     def Dynamics(self,prop,xt,filt_t=None,weights_t=None,
                  filt_option='simple', block_average=False,
@@ -14450,7 +14472,8 @@ class coreFunctions():
         return
 
     @staticmethod
-    def gofr_pairs(self,ids1,ids2,bins,gofr):
+    def gofr_pairs(self, ids1, ids2, bins, gofr):
+        """Accumulate pair distances between two atom sets into g(r) using chunking to save memory."""
         """Accumulate pair distances between two atom sets into :math:`g(r)`.
 
         Parameters
@@ -14467,21 +14490,35 @@ class coreFunctions():
         """
         frame = self.current_frame
         coords = self.get_coords(frame)
-
-        c1 = coords[ids1]
-        c2 = coords[ids2]
         box = self.get_box(frame)
 
+        # We will process 10 million pairs at a time. 
+        # This uses ~250 MB of RAM instead of 160+ GB!
+        chunk_size = 10_000_000 
+        total_pairs = len(ids1)
+        
+        for start in range(0, total_pairs, chunk_size):
+            end = min(start + chunk_size, total_pairs)
+            
+            # 1. Grab just a small chunk of coordinates
+            c1_chunk = coords[ids1[start:end]]
+            c2_chunk = coords[ids2[start:end]]
+            
+            # 2. Calculate relative coordinates and distances for ONLY this chunk
+            relc = minimum_image_relative_coords(c2_chunk - c1_chunk, box)
+            pd = np.sum(relc * relc, axis=1)**0.5
+            
+            # 3. Filter by dmax
+            pd = pd[pd <= bins.max()]
+            
+            # 4. Add this chunk's distances to the main histogram
+            numba_bin_count(pd, bins, gofr)
+            
+            # (Optional) Print progress for the first frame to reassure you it's working
+            #if frame == 0 and end % 500_000_000 == 0:
+            #   print(f"DEBUG: Frame 0 - Processed {end}/{total_pairs} pairs...", flush=True)
 
-        relc = minimum_image_relative_coords(c2-c1,box)
-        pd =np.sum(relc*relc,axis=1)**0.5
-
-        pd = pd[pd<=bins.max()]
-
-        numba_bin_count(pd,bins,gofr)
-
-        return
-
+        return        
 
 @jit(nopython=True,fastmath=True)
 def fill_property(prop,nv,i,j,value,mi,block_average):
@@ -14988,7 +15025,7 @@ def CrossDynamicProperty_kernel(Prop, nv, xt1, xt2,
                 for j in range(n2):
                     if avoid_self and i == j:
                         continue
-                    val += cross_msd_kernel(xt1[t0, i], xt1[tau, i],
+                    val += cross_TSD_kernel(xt1[t0, i], xt1[tau, i],
                                             xt2[t0, j], xt2[tau, j])
             idx = tau - t0
             Prop[idx] += val
@@ -15054,7 +15091,7 @@ def CrossDynamicProperty_filterkernel(Prop, nv, xt1, xt2, ft1, ft2,
                                                ft2[t0, j], ft2[tau, j],
                                                both_times, both_pairs):
                         continue
-                    val += cross_msd_kernel(xt1[t0, i], xt1[tau, i],
+                    val += cross_TSD_kernel(xt1[t0, i], xt1[tau, i],
                                             xt2[t0, j], xt2[tau, j])
             idx = tau - t0
             Prop[idx] += val
@@ -15620,7 +15657,7 @@ def norm_square_kernel(r1,r2,*args):
     return nm
 
 @jit(nopython=True,fastmath=True)
-def cross_msd_kernel(r1_0, r1_t, r2_0, r2_t):
+def cross_TSD_kernel(r1_0, r1_t, r2_0, r2_t):
     """Dot product of displacements for cross-correlation MSD.
 
     Computes (r1_t - r1_0) · (r2_t - r2_0) for distinct diffusion terms.
@@ -15641,6 +15678,7 @@ def cross_msd_kernel(r1_0, r1_t, r2_0, r2_t):
     for d in range(r1_0.shape[0]): # typically, over the 3 dimensions
         dot += (r1_t[d] - r1_0[d]) * (r2_t[d] - r2_0[d])
     return dot
+
 
 @jit(nopython=True,fastmath=True,parallel=True)
 def costh__parallelkernel(r1,r2,*args):
