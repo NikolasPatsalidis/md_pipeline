@@ -2093,22 +2093,94 @@ class Energetic_Analysis():
         """
         with open(self.data_file) as f:
             lines = f.readlines()
-            f.closed
 
         columns = ['time']  # initialize columns with 'time'
-        for i,line in enumerate(lines):
+        rows = []
+        for line in lines:
             l = line.split()
-            if l[0] == '@' and l[1][0] == 's' and l[2] == 'legend':
-                columns.append(l[3].strip('"'))  # extract legend names
-                last_legend = i
-            elif line[0] == '@' or line[0] == '#':
+            if len(l) == 0 or line[0] == '#':
                 continue
-            else:
-                break
+            if line[0] == '@':
+                # e.g. @ s1 legend "Kinetic En." -> the full quoted name, spaces included
+                if len(l) > 2 and l[1][0] == 's' and l[2] == 'legend':
+                    columns.append(line.split('"')[1])
+                continue
+            rows.append(l)
 
-        # extract numerical data after last legend line
-        data = np.array([line.split() for line in lines[last_legend+1:]], dtype=float)
+        data = np.array(rows, dtype=float)
         self.data = pd.DataFrame(data, columns=columns)
+        return
+
+    # units of the common gmx energy terms, used for the y labels
+    units = {'Potential':'kJ/mol', 'Kinetic En.':'kJ/mol', 'Total Energy':'kJ/mol',
+             'Conserved En.':'kJ/mol', 'Enthalpy':'kJ/mol', 'Temperature':'K',
+             'Pressure':'bar', 'Volume':r'nm$^3$', 'Density':r'kg/m$^3$',
+             'Box-X':'nm', 'Box-Y':'nm', 'Box-Z':'nm', 'pV':'kJ/mol'}
+
+    def multi_plot(self,groups=None,size=3.5,dpi=300,time_units='ns',
+                   title=None,fname=None,cmap=None):
+        """
+        Plot the energy terms versus time, one subplot per group of columns.
+        Parameters
+        ----------
+        groups : list of lists of str, columns drawn together in each subplot.
+            Default: Potential, Kinetic and Total energy in the first subplot,
+            every other column in its own subplot.
+        size : float, figure width in inches; fonts, line widths and ticks scale with it
+        dpi : int, figure resolution in dots per inch
+        time_units : str, 'ps' (as in the file) or 'ns'
+        title : str or None, title of the figure
+        fname : str or None, filename for saving
+        cmap : dict or None, colors for each column
+        """
+        if groups is None:
+            energies = [c for c in ['Potential','Kinetic En.','Total Energy']
+                        if c in self.data.columns]
+            groups = [energies] if energies else []
+            groups += [[c] for c in self.data.columns
+                       if c != 'time' and c not in energies]
+        if cmap is None:
+            c = plotter.colors.semisafe
+            cols = [col for g in groups for col in g]
+            cmap = {col: c[i % len(c)] for i,col in enumerate(cols)}
+
+        x = self.data['time'].to_numpy()
+        if time_units == 'ns':
+            x = x/1000
+
+        n = len(groups)
+        figsize = (size, 0.45*size*n)
+        fs = 2.5*size/3  # base font size
+        # constrained layout keeps room for every label, including the x label
+        fig,axes = plt.subplots(n,1,figsize=figsize,dpi=dpi,sharex=True,squeeze=False,
+                                layout='constrained')
+        axes = axes[:,0]
+        if title is not None:
+            fig.suptitle(title, fontsize=1.2*fs)
+        for ax,group in zip(axes,groups):
+            ax.minorticks_on()
+            ax.tick_params(direction='in', which='minor', length=size*0.5,
+                           width=size*0.1, labelsize=fs)
+            ax.tick_params(direction='in', which='major', length=size*1.0,
+                           width=size*0.15, labelsize=fs)
+            for spine in ax.spines.values():
+                spine.set_linewidth(size*0.15)
+            ax.yaxis.get_offset_text().set_fontsize(fs)  # the "1e6" multiplier
+            for col in group:
+                ax.plot(x, self.data[col].to_numpy(), lw=0.15*size,
+                        color=cmap[col], label=col)
+            unit = self.units.get(group[0], '')
+            name = 'Energy' if len(group) > 1 else group[0]
+            ax.set_ylabel('{:s} ({:s})'.format(name,unit) if unit else name,
+                          fontsize=fs)
+            if len(group) > 1:
+                ax.legend(frameon=False, fontsize=0.92*fs, ncol=len(group))
+        axes[-1].set_xlabel('time ({:s})'.format(time_units), fontsize=1.2*fs)
+        axes[-1].set_xlim(x[0], x[-1])
+        fig.align_ylabels(axes)
+        if fname is not None:
+            plt.savefig(fname, bbox_inches='tight')
+        plt.show()
         return
 
     def simple_plot(self,ycols,xcol='time',size=3.5,dpi=300,
@@ -11938,6 +12010,23 @@ class Analysis_Confined(Analysis):
         d = self.get_distance_from_ref(coords, rf)
         return coords,box,d
 
+    def get_frame_basics_minimum_image_included(self,frame):
+        """Same as get_frame_basics but the distances from the reference point
+        follow the minimum image convention, so the result does not depend on
+        where the reference point sits in the box.
+        """
+        # TODO(refactor): only spherical confinement uses minimum image here.
+        # Generalize: every conftype should get its distances under minimum
+        # image (e.g. through the Distance_Functions dispatch), and then this
+        # function should replace get_frame_basics under a meaningful name.
+        if self.conftype != 'spherical':
+            return self.get_frame_basics(frame)
+        box  = self.get_box(frame)
+        coords = self.get_coords(frame)%box
+        rf = self.get_reference_point(self.current_frame)%box
+        d = minimum_image_distance(coords, rf, box)
+        return coords,box,d
+
     def get_whole_frame_basics(self,frame):
         coords = self.get_whole_coords(frame)
         box  = self.get_box(frame)
@@ -13443,7 +13532,7 @@ class coreFunctions():
         """
         frame = self.current_frame
 
-        coords,box,d = self.get_frame_basics(frame)
+        coords,box,d = self.get_frame_basics_minimum_image_included(frame)
 
         # Loop over distance bins: compute shell volume and add mass/volume contribution
         for i in range(nbins):
@@ -13478,7 +13567,7 @@ class coreFunctions():
         """
 
         frame = self.current_frame
-        coords,box,d = self.get_frame_basics(frame)
+        coords,box,d = self.get_frame_basics_minimum_image_included(frame)
 
         # Loop over distance bins and molecule types: accumulate per-molecule mass/volume
         for i in range(nbins):
@@ -13516,7 +13605,7 @@ class coreFunctions():
         """
 
         frame = self.current_frame
-        coords,box,d = self.get_frame_basics(frame)
+        coords,box,d = self.get_frame_basics_minimum_image_included(frame)
 
         # Loop over bins and atom types: reuse mass_bin and slice per-type masks in that bin
         for i in range(nbins):
@@ -13555,7 +13644,7 @@ class coreFunctions():
             Pre-computed square of the mean density per bin.
         """
         frame = self.current_frame
-        coords,box,d = self.get_frame_basics(frame)
+        coords,box,d = self.get_frame_basics_minimum_image_included(frame)
 
         # For each bin, accumulate <rho^2> - rho_mean_sq from instantaneous mass/volume
         for i in range(nbins):
@@ -13663,7 +13752,7 @@ class coreFunctions():
             Boolean masks per atom type.
         """
         frame = self.current_frame
-        coords,box,d = self.get_frame_basics(frame)
+        coords,box,d = self.get_frame_basics_minimum_image_included(frame)
 
         # Loop over bins and atom types: counts per bin and per type
         for i in range(nbins):
@@ -13692,7 +13781,7 @@ class coreFunctions():
             number density contributions.
         """
         frame = self.current_frame
-        coords,box,d = self.get_frame_basics(frame)
+        coords,box,d = self.get_frame_basics_minimum_image_included(frame)
 
         # Standard 1D number-density histogram over distance from the confining object
         for i in range(nbins):
